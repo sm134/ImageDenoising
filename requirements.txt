@@ -1,0 +1,6 @@
+numpy>=1.23.5
+tensorflow==2.16.1
+keras>=3.0.0
+pillow>=9.0.0
+requests>=2.27.1
+matplotlib>=3.7.1

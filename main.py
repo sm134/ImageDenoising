@@ -258,7 +258,7 @@ class ZeroDCE(keras.Model):
 
 zero_dce_model = ZeroDCE()
 zero_dce_model.compile(learning_rate=1e-4)
-history = zero_dce_model.fit(train_dataset, validation_data=val_dataset, epochs=1)
+history = zero_dce_model.fit(train_dataset, validation_data=val_dataset, epochs=100)
 
 
 def plot_result(item):

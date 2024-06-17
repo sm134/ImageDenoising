@@ -25,31 +25,45 @@ IMAGE_SIZE = 256
 BATCH_SIZE = 16
 MAX_TRAIN_IMAGES = 400
 
-def load_data(image_path):
-    image = tf.io.read_file(image_path)
-    image = tf.image.decode_png(image, channels=3)
-    image = tf.image.resize(images=image, size=[IMAGE_SIZE, IMAGE_SIZE])
-    image = image / 255.0
-    return image
+def load_data_pair(low_image_path, high_image_path):
+    low_image = tf.io.read_file(low_image_path)
+    low_image = tf.image.decode_png(low_image, channels=3)
+    low_image = tf.image.resize(low_image, [IMAGE_SIZE, IMAGE_SIZE])
+    low_image = low_image / 255.0
 
-def data_generator(low_light_images):
-    dataset = tf.data.Dataset.from_tensor_slices((low_light_images))
-    dataset = dataset.map(load_data, num_parallel_calls=tf.data.AUTOTUNE)
+    high_image = tf.io.read_file(high_image_path)
+    high_image = tf.image.decode_png(high_image, channels=3)
+    high_image = tf.image.resize(high_image, [IMAGE_SIZE, IMAGE_SIZE])
+    high_image = high_image / 255.0
+
+    return low_image, high_image
+
+def data_generator_pair(low_light_images, high_light_images):
+    def load_data_pair_wrapper(low_image_path, high_image_path):
+        low_image, high_image = load_data_pair(low_image_path, high_image_path)
+        return low_image, high_image
+
+    dataset = tf.data.Dataset.from_tensor_slices((low_light_images, high_light_images))
+    dataset = dataset.map(load_data_pair_wrapper, num_parallel_calls=tf.data.AUTOTUNE)
     dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
     return dataset
+
 
 train_low_light_images = sorted(glob("./lol_dataset/our485/low/*"))[:MAX_TRAIN_IMAGES]
 val_low_light_images = sorted(glob("./lol_dataset/our485/low/*"))[MAX_TRAIN_IMAGES:]
 test_low_light_images = sorted(glob("./lol_dataset/eval15/low/*"))
+train_high_light_images = sorted(glob("./lol_dataset/our485/high/*"))[:MAX_TRAIN_IMAGES]
+val_high_light_images = sorted(glob("./lol_dataset/our485/high/*"))[MAX_TRAIN_IMAGES:]
 
-train_dataset = data_generator(train_low_light_images)
-val_dataset = data_generator(val_low_light_images)
+
+train_dataset = data_generator_pair(train_low_light_images, train_high_light_images)
+val_dataset = data_generator_pair(val_low_light_images, val_high_light_images)
 
 print("Train Dataset:", train_dataset)
 print("Validation Dataset:", val_dataset)
 
-def build_dce_net():
-    input_img = keras.Input(shape=[None, None, 3])
+def build_dce_net(input_shape=(None, None, 3)):
+    input_img = keras.Input(shape=input_shape)
     conv1 = layers.Conv2D(32, (3, 3), strides=(1, 1), activation="relu", padding="same")(input_img)
     conv2 = layers.Conv2D(32, (3, 3), strides=(1, 1), activation="relu", padding="same")(conv1)
     conv3 = layers.Conv2D(32, (3, 3), strides=(1, 1), activation="relu", padding="same")(conv2)
@@ -100,26 +114,38 @@ def spatial_constancy_loss(original_img, enhanced_img, patch_size):
     loss = tf.reduce_mean(tf.square(original_gradient_y - enhanced_gradient_y)) + \
            tf.reduce_mean(tf.square(original_gradient_x - enhanced_gradient_x))
     return loss
-    
+  
 class ZeroDCE(keras.Model):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.dce_model = build_dce_net()
-        self.loss_tracker = {
-            "total_loss": keras.metrics.Mean(name="total_loss"),
-            "illumination_smoothness_loss": keras.metrics.Mean(name="illumination_smoothness_loss"),
-            "spatial_constancy_loss": keras.metrics.Mean(name="spatial_constancy_loss"),
-            "color_constancy_loss": keras.metrics.Mean(name="color_constancy_loss"),
-            "exposure_loss": keras.metrics.Mean(name="exposure_loss"),
-        }
 
     def compile(self, learning_rate, **kwargs):
         super().compile(**kwargs)
         self.optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
+        self.illumination_smoothness_loss_tracker = keras.metrics.Mean(
+            name="illumination_smoothness_loss"
+        )
+        self.spatial_constancy_loss_tracker = keras.metrics.Mean(
+            name="spatial_constancy_loss"
+        )
+        self.color_constancy_loss_tracker = keras.metrics.Mean(
+            name="color_constancy_loss"
+        )
+        self.exposure_loss_tracker = keras.metrics.Mean(name="exposure_loss")
+        self.psnr_tracker = keras.metrics.Mean(name="psnr")
 
     @property
     def metrics(self):
-        return list(self.loss_tracker.values())
+        return [
+            self.total_loss_tracker,
+            self.illumination_smoothness_loss_tracker,
+            self.spatial_constancy_loss_tracker,
+            self.color_constancy_loss_tracker,
+            self.exposure_loss_tracker,
+            self.psnr_tracker,
+        ]
 
     def get_enhanced_image(self, data, output):
         r1 = output[:, :, :, :3]
@@ -150,7 +176,13 @@ class ZeroDCE(keras.Model):
         loss_spatial_constancy = tf.reduce_mean(spatial_constancy_loss(data, enhanced_image, patch_size=32))
         loss_color_constancy = 5 * tf.reduce_mean(color_constancy_loss(enhanced_image))
         loss_exposure = 10 * tf.reduce_mean(exposure_loss(enhanced_image))
-        total_loss = loss_illumination + loss_spatial_constancy + loss_color_constancy + loss_exposure
+        total_loss = (
+            loss_illumination
+            + loss_spatial_constancy
+            + loss_color_constancy
+            + loss_exposure
+        )
+
         return {
             "total_loss": total_loss,
             "illumination_smoothness_loss": loss_illumination,
@@ -159,43 +191,75 @@ class ZeroDCE(keras.Model):
             "exposure_loss": loss_exposure,
         }
 
-    def train_step(self, data):
-        with tf.GradientTape() as tape:
-            output = self.dce_model(data)
-            losses = self.compute_losses(data, output)
+    def psnr(self, y_true, y_pred):
+        return tf.image.psnr(y_true, y_pred, max_val=255.0)
 
-        gradients = tape.gradient(losses["total_loss"], self.dce_model.trainable_weights)
+    def train_step(self, data):
+        low_light_images, high_light_images = data
+        with tf.GradientTape() as tape:
+            output = self.dce_model(low_light_images)
+            losses = self.compute_losses(low_light_images, output)
+            enhanced_image = self.get_enhanced_image(low_light_images, output)
+
+        gradients = tape.gradient(
+            losses["total_loss"], self.dce_model.trainable_weights
+        )
         self.optimizer.apply_gradients(zip(gradients, self.dce_model.trainable_weights))
 
-        self.loss_tracker["total_loss"].update_state(losses["total_loss"])
-        self.loss_tracker["illumination_smoothness_loss"].update_state(losses["illumination_smoothness_loss"])
-        self.loss_tracker["spatial_constancy_loss"].update_state(losses["spatial_constancy_loss"])
-        self.loss_tracker["color_constancy_loss"].update_state(losses["color_constancy_loss"])
-        self.loss_tracker["exposure_loss"].update_state(losses["exposure_loss"])
+        self.total_loss_tracker.update_state(losses["total_loss"])
+        self.illumination_smoothness_loss_tracker.update_state(
+            losses["illumination_smoothness_loss"]
+        )
+        self.spatial_constancy_loss_tracker.update_state(
+            losses["spatial_constancy_loss"]
+        )
+        self.color_constancy_loss_tracker.update_state(losses["color_constancy_loss"])
+        self.exposure_loss_tracker.update_state(losses["exposure_loss"])
+        self.psnr_tracker.update_state(self.psnr(high_light_images, enhanced_image))
 
         return {metric.name: metric.result() for metric in self.metrics}
 
     def test_step(self, data):
-        output = self.dce_model(data)
-        losses = self.compute_losses(data, output)
+        low_light_images, high_light_images = data
+        output = self.dce_model(low_light_images)
+        losses = self.compute_losses(low_light_images, output)
+        enhanced_image = self.get_enhanced_image(low_light_images, output)
 
-        self.loss_tracker["total_loss"].update_state(losses["total_loss"])
-        self.loss_tracker["illumination_smoothness_loss"].update_state(losses["illumination_smoothness_loss"])
-        self.loss_tracker["spatial_constancy_loss"].update_state(losses["spatial_constancy_loss"])
-        self.loss_tracker["color_constancy_loss"].update_state(losses["color_constancy_loss"])
-        self.loss_tracker["exposure_loss"].update_state(losses["exposure_loss"])
+        self.total_loss_tracker.update_state(losses["total_loss"])
+        self.illumination_smoothness_loss_tracker.update_state(
+            losses["illumination_smoothness_loss"]
+        )
+        self.spatial_constancy_loss_tracker.update_state(
+            losses["spatial_constancy_loss"]
+        )
+        self.color_constancy_loss_tracker.update_state(losses["color_constancy_loss"])
+        self.exposure_loss_tracker.update_state(losses["exposure_loss"])
+        self.psnr_tracker.update_state(self.psnr(high_light_images, enhanced_image))
 
         return {metric.name: metric.result() for metric in self.metrics}
 
     def save_weights(self, filepath, overwrite=True, save_format=None, options=None):
-        self.dce_model.save_weights(filepath, overwrite=overwrite, save_format=save_format, options=options)
+        """While saving the weights, we simply save the weights of the DCE-Net"""
+        self.dce_model.save_weights(
+            filepath,
+            overwrite=overwrite,
+            save_format=save_format,
+            options=options,
+        )
 
     def load_weights(self, filepath, by_name=False, skip_mismatch=False, options=None):
-        self.dce_model.load_weights(filepath=filepath, by_name=by_name, skip_mismatch=skip_mismatch, options=options)
+        """While loading the weights, we simply load the weights of the DCE-Net"""
+        self.dce_model.load_weights(
+            filepath=filepath,
+            by_name=by_name,
+            skip_mismatch=skip_mismatch,
+            options=options,
+        )
 
 zero_dce_model = ZeroDCE()
 zero_dce_model.compile(learning_rate=1e-4)
-history = zero_dce_model.fit(train_dataset, validation_data=val_dataset, epochs=50)
+history = zero_dce_model.fit(train_dataset, validation_data=val_dataset, epochs=1)
+
 
 def plot_result(item):
     plt.plot(history.history[item], label=item)
@@ -206,6 +270,7 @@ def plot_result(item):
     plt.legend()
     plt.grid()
     plt.show()
+
 
 plot_result("total_loss")
 plot_result("illumination_smoothness_loss")
@@ -230,18 +295,6 @@ def infer(original_image):
     output_image = Image.fromarray(output_image.numpy())
     return output_image
 
-def calculate_psnr(original, enhanced):
-    original = np.array(original)
-    enhanced = np.array(enhanced)
-    mse = np.mean((original - enhanced) ** 2)
-    if mse == 0:
-        return float('inf')
-    max_pixel = 255.0
-    psnr = 20 * np.log10(max_pixel / np.sqrt(mse))
-    return psnr
-
-
-
 
 base_directory = os.getcwd()
 print("Base Directory:", base_directory)
@@ -249,14 +302,13 @@ print("Base Directory:", base_directory)
 # Define the paths relative to the base directory
 test_directory = os.path.join(base_directory, "test/low")
 predicted_directory = os.path.join(base_directory, "test/predicted")
+original_directory = os.path.join(base_directory, "test/original")
 
 for val_image_file in os.listdir(test_directory):
     val_image_path = os.path.join(test_directory, val_image_file)
     if os.path.isfile(val_image_path):
         original_image = Image.open(val_image_path)
         enhanced_image = infer(original_image)
-        psnr_value = calculate_psnr(original_image, enhanced_image)
-        print(f"PSNR value: {psnr_value} dB")
         base_name = os.path.basename(val_image_file)
         save_path = os.path.join(predicted_directory, base_name)
         enhanced_image.save(save_path)
@@ -265,9 +317,3 @@ for val_image_file in os.listdir(test_directory):
             ["Original", "Enhanced"],
             (20, 12),
         )
-
-
-
-
-
-

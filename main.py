@@ -100,15 +100,6 @@ def spatial_constancy_loss(original_img, enhanced_img, patch_size):
     loss = tf.reduce_mean(tf.square(original_gradient_y - enhanced_gradient_y)) + \
            tf.reduce_mean(tf.square(original_gradient_x - enhanced_gradient_x))
     return loss
-
-def mse_loss(original_img, enhanced_img):
-    return tf.reduce_mean(tf.square(original_img - enhanced_img))
-
-def mae_loss(original_img, enhanced_img):
-    return tf.reduce_mean(tf.abs(original_img - enhanced_img))
-
-def psnr_metric(original_img, enhanced_img):
-    return tf.image.psnr(original_img, enhanced_img, max_val=1.0)
     
 class ZeroDCE(keras.Model):
     def __init__(self, **kwargs):
@@ -120,9 +111,6 @@ class ZeroDCE(keras.Model):
             "spatial_constancy_loss": keras.metrics.Mean(name="spatial_constancy_loss"),
             "color_constancy_loss": keras.metrics.Mean(name="color_constancy_loss"),
             "exposure_loss": keras.metrics.Mean(name="exposure_loss"),
-            "mse_loss": keras.metrics.Mean(name="mse_loss"),
-            "mae_loss": keras.metrics.Mean(name="mae_loss"),
-            "psnr_metric": keras.metrics.Mean(name="psnr_metric"),
         }
 
     def compile(self, learning_rate, **kwargs):
@@ -162,9 +150,6 @@ class ZeroDCE(keras.Model):
         loss_spatial_constancy = tf.reduce_mean(spatial_constancy_loss(data, enhanced_image, patch_size=32))
         loss_color_constancy = 5 * tf.reduce_mean(color_constancy_loss(enhanced_image))
         loss_exposure = 10 * tf.reduce_mean(exposure_loss(enhanced_image))
-        loss_mse = mse_loss(data, enhanced_image)
-        loss_mae = mae_loss(data, enhanced_image)
-        psnr = psnr_metric(data, enhanced_image)
         total_loss = loss_illumination + loss_spatial_constancy + loss_color_constancy + loss_exposure
         return {
             "total_loss": total_loss,
@@ -172,9 +157,6 @@ class ZeroDCE(keras.Model):
             "spatial_constancy_loss": loss_spatial_constancy,
             "color_constancy_loss": loss_color_constancy,
             "exposure_loss": loss_exposure,
-            "mse_loss": loss_mse,
-            "mae_loss": loss_mae,
-            "psnr_metric": psnr,
         }
 
     def train_step(self, data):
@@ -190,9 +172,6 @@ class ZeroDCE(keras.Model):
         self.loss_tracker["spatial_constancy_loss"].update_state(losses["spatial_constancy_loss"])
         self.loss_tracker["color_constancy_loss"].update_state(losses["color_constancy_loss"])
         self.loss_tracker["exposure_loss"].update_state(losses["exposure_loss"])
-        self.loss_tracker["mse_loss"].update_state(losses["mse_loss"])
-        self.loss_tracker["mae_loss"].update_state(losses["mae_loss"])
-        self.loss_tracker["psnr_metric"].update_state(losses["psnr_metric"])
 
         return {metric.name: metric.result() for metric in self.metrics}
 
@@ -205,9 +184,6 @@ class ZeroDCE(keras.Model):
         self.loss_tracker["spatial_constancy_loss"].update_state(losses["spatial_constancy_loss"])
         self.loss_tracker["color_constancy_loss"].update_state(losses["color_constancy_loss"])
         self.loss_tracker["exposure_loss"].update_state(losses["exposure_loss"])
-        self.loss_tracker["mse_loss"].update_state(losses["mse_loss"])
-        self.loss_tracker["mae_loss"].update_state(losses["mae_loss"])
-        self.loss_tracker["psnr_metric"].update_state(losses["psnr_metric"])
 
         return {metric.name: metric.result() for metric in self.metrics}
 
@@ -236,9 +212,6 @@ plot_result("illumination_smoothness_loss")
 plot_result("spatial_constancy_loss")
 plot_result("color_constancy_loss")
 plot_result("exposure_loss")
-plot_result("mse_loss")
-plot_result("mae_loss")
-plot_result("psnr_metric")
 
 def plot_results(images, titles, figure_size=(12, 12)):
     fig = plt.figure(figsize=figure_size)
